@@ -40,19 +40,19 @@ chmod +x switch-codex-config.sh
 直接运行交互菜单：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/zz555z/swith-codex-config/main/switch-codex-config.sh)
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/zz555z/swith-codex-config@main/switch-codex-config.sh)
 ```
 
 只查看帮助：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/zz555z/swith-codex-config/main/switch-codex-config.sh) --help
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/zz555z/swith-codex-config@main/switch-codex-config.sh) --help
 ```
 
 更稳妥的方式是先下载再执行：
 
 ```bash
-curl -fsSL -o /tmp/switch-codex-config.sh https://raw.githubusercontent.com/zz555z/swith-codex-config/main/switch-codex-config.sh
+curl -fsSL -o /tmp/switch-codex-config.sh https://cdn.jsdelivr.net/gh/zz555z/swith-codex-config@main/switch-codex-config.sh
 bash /tmp/switch-codex-config.sh
 ```
 
