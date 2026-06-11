@@ -9,44 +9,31 @@ CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
 PROVIDER=""
 PROVIDER_NAME=""
 BASE_URL=""
-TOKEN="${CODEX_TOKEN:-}"
+TOKEN=""
 MODEL=""
-WIRE_API=""
-DRY_RUN=0
+WIRE_API="responses"
 SCRIPT_NAME="$(basename "$0")"
-MENU_MODE=0
+PROVIDER_KEYS_PASSPHRASE="switchcodex"
+PROVIDER_TOKEN_ENCRYPTION="openssl-enc-aes-256-cbc-pbkdf2"
+PROVIDER_TOKEN_ITERATIONS=200000
 
 usage() {
   cat <<'EOF'
 用法:
   ./switch-codex-config.sh
-  ./switch-codex-config.sh --base-url URL --model MODEL [--token TOKEN]
-  CODEX_TOKEN=TOKEN ./switch-codex-config.sh --base-url URL --model MODEL
 
 交互菜单:
   1) 添加/更新模型配置
   2) 查看模型配置
   3) 删除模型配置
   4) 设置当前模型配置
-  5) 应用 Codex 启动加速 hosts 配置
 
-选项:
-  --config PATH       Codex 配置文件路径。默认: ~/.codex/config.toml
-  --provider NAME     provider 名称，会写成 [model_providers.NAME]，同时 name = "NAME"
-  --name NAME         等同于 --provider NAME，保留用于兼容旧调用
-  --base-url URL      新的 provider base_url
-  --token TOKEN       新的 experimental_bearer_token。建议使用 CODEX_TOKEN 或 --token-stdin。
-  --token-stdin       从标准输入读取 token
-  --model MODEL       兼容旧用法：添加/更新 provider 后，同时设为顶层 Codex model。
-                     交互菜单添加配置时不需要填写 model。
-  --wire-api VALUE    provider wire_api 值。默认: responses
-  --dry-run           只显示将要修改的内容，不写入文件
-  -h, --help          显示帮助
+配置文件:
+  默认修改 ~/.codex/config.toml
+  可用 CODEX_CONFIG=/path/to/config.toml 指定其他配置文件
 
 示例:
   ./switch-codex-config.sh
-  ./switch-codex-config.sh --provider custom --base-url https://muyuan.do/v1 --model gpt-5.5 --token-stdin
-  CODEX_TOKEN='sk-...' ./switch-codex-config.sh --provider custom --base-url https://new.sharedchat.cc/codex --model gpt-5.5 --wire-api responses
 EOF
 }
 
@@ -63,10 +50,6 @@ trim_input() {
   printf '%s' "$1" | LC_ALL=C sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
-can_prompt() {
-  [[ "$MENU_MODE" -eq 1 || -t 0 ]]
-}
-
 show_back_hint() {
   local target="${1:-上一级菜单}"
   echo "提示: 输入 b 返回${target}" >&2
@@ -80,18 +63,9 @@ reset_request_vars() {
   PROVIDER=""
   PROVIDER_NAME=""
   BASE_URL=""
-  TOKEN="${CODEX_TOKEN:-}"
+  TOKEN=""
   MODEL=""
-  WIRE_API=""
-  DRY_RUN=0
-}
-
-menu_error_or_die() {
-  if [[ "$MENU_MODE" -eq 1 ]]; then
-    echo "$*" >&2
-    return 0
-  fi
-  die "$*"
+  WIRE_API="responses"
 }
 
 ensure_config_exists() {
@@ -99,14 +73,250 @@ ensure_config_exists() {
 }
 
 backup_config() {
+  backup_file_if_exists "$CONFIG"
+}
+
+config_dir() {
+  dirname "$CONFIG"
+}
+
+auth_file() {
+  printf '%s/auth.json\n' "$(config_dir)"
+}
+
+provider_keys_file() {
+  printf '%s/provider-keys.json\n' "$(config_dir)"
+}
+
+backup_file_if_exists() {
+  local file="$1"
   local backup
-  backup="$CONFIG.backup.$(date +%Y%m%d_%H%M%S).$SCRIPT_NAME"
-  cp "$CONFIG" "$backup"
+  if [[ ! -f "$file" ]]; then
+    return 0
+  fi
+
+  backup="$file.bak.$(date +%Y%m%d)"
+  if [[ ! -f "$backup" ]]; then
+    cp "$file" "$backup"
+  fi
   printf '%s\n' "$backup"
 }
 
 redact() {
   printf '[redacted]'
+}
+
+require_openssl() {
+  command -v openssl >/dev/null 2>&1 || die "未找到 openssl，无法加密或解密 provider key。"
+}
+
+get_provider_keys_passphrase() {
+  printf '%s' "$PROVIDER_KEYS_PASSPHRASE"
+}
+
+encrypt_provider_token() {
+  local token="$1"
+  local passphrase
+  require_openssl
+  passphrase="$(get_provider_keys_passphrase encrypt)" || return 1
+  printf '%s' "$token" | CODEX_PROVIDER_KEYS_PASSPHRASE="$passphrase" openssl enc \
+    -aes-256-cbc \
+    -pbkdf2 \
+    -iter "$PROVIDER_TOKEN_ITERATIONS" \
+    -salt \
+    -base64 \
+    -A \
+    -pass env:CODEX_PROVIDER_KEYS_PASSPHRASE
+}
+
+decrypt_provider_token() {
+  local encrypted_token="$1"
+  local passphrase
+  require_openssl
+  passphrase="$(get_provider_keys_passphrase decrypt)" || return 1
+  if ! printf '%s' "$encrypted_token" | CODEX_PROVIDER_KEYS_PASSPHRASE="$passphrase" openssl enc \
+    -d \
+    -aes-256-cbc \
+    -pbkdf2 \
+    -iter "$PROVIDER_TOKEN_ITERATIONS" \
+    -base64 \
+    -A \
+    -pass env:CODEX_PROVIDER_KEYS_PASSPHRASE; then
+    echo "provider key 解密失败，请检查口令是否正确。" >&2
+    return 1
+  fi
+}
+
+provider_encrypted_token() {
+  local provider="$1"
+  local keys_file
+  keys_file="$(provider_keys_file)"
+  [[ -f "$keys_file" ]] || return 0
+
+  PROVIDER_KEYS_FILE="$keys_file" PROVIDER_ID="$provider" ruby <<'RUBY'
+require "json"
+
+path = ENV.fetch("PROVIDER_KEYS_FILE")
+provider = ENV.fetch("PROVIDER_ID")
+data = JSON.parse(File.read(path))
+value = data.dig("providers", provider, "token_encrypted")
+print value if value.is_a?(String)
+RUBY
+}
+
+provider_plain_token() {
+  local provider="$1"
+  local keys_file
+  keys_file="$(provider_keys_file)"
+  [[ -f "$keys_file" ]] || return 0
+
+  PROVIDER_KEYS_FILE="$keys_file" PROVIDER_ID="$provider" ruby <<'RUBY'
+require "json"
+
+path = ENV.fetch("PROVIDER_KEYS_FILE")
+provider = ENV.fetch("PROVIDER_ID")
+data = JSON.parse(File.read(path))
+value = data.dig("providers", provider, "token")
+print value if value.is_a?(String)
+RUBY
+}
+
+provider_has_token() {
+  local provider="$1"
+  local keys_file
+  keys_file="$(provider_keys_file)"
+  [[ -f "$keys_file" ]] || return 1
+
+  PROVIDER_KEYS_FILE="$keys_file" PROVIDER_ID="$provider" ruby <<'RUBY'
+require "json"
+
+path = ENV.fetch("PROVIDER_KEYS_FILE")
+provider = ENV.fetch("PROVIDER_ID")
+data = JSON.parse(File.read(path))
+entry = data.dig("providers", provider)
+exit 1 unless entry.is_a?(Hash)
+encrypted = entry["token_encrypted"]
+plain = entry["token"]
+has_token = (encrypted.is_a?(String) && !encrypted.empty?) || (plain.is_a?(String) && !plain.empty?)
+exit(has_token ? 0 : 1)
+RUBY
+}
+
+read_provider_token() {
+  local provider="$1"
+  local encrypted_token
+  local plain_token
+
+  encrypted_token="$(provider_encrypted_token "$provider")"
+  if [[ -n "$encrypted_token" ]]; then
+    decrypt_provider_token "$encrypted_token"
+    return
+  fi
+
+  plain_token="$(provider_plain_token "$provider")"
+  if [[ -n "$plain_token" ]]; then
+    printf '%s' "$plain_token"
+  fi
+}
+
+write_provider_token() {
+  local provider="$1"
+  local token="$2"
+  local encrypted_token
+  local keys_file
+  local tmp_keys
+  encrypted_token="$(encrypt_provider_token "$token")" || return 1
+  keys_file="$(provider_keys_file)"
+  mkdir -p "$(dirname "$keys_file")"
+  tmp_keys="$(mktemp "${keys_file}.tmp.XXXXXX")"
+  trap 'rm -f "$tmp_keys"' EXIT
+
+  PROVIDER_KEYS_FILE="$keys_file" \
+    PROVIDER_ID="$provider" \
+    PROVIDER_TOKEN_ENCRYPTED="$encrypted_token" \
+    PROVIDER_TOKEN_ENCRYPTION="$PROVIDER_TOKEN_ENCRYPTION" \
+    PROVIDER_TOKEN_ITERATIONS="$PROVIDER_TOKEN_ITERATIONS" \
+    ruby > "$tmp_keys" <<'RUBY'
+require "json"
+
+path = ENV.fetch("PROVIDER_KEYS_FILE")
+provider = ENV.fetch("PROVIDER_ID")
+encrypted_token = ENV.fetch("PROVIDER_TOKEN_ENCRYPTED")
+encryption = ENV.fetch("PROVIDER_TOKEN_ENCRYPTION")
+iterations = ENV.fetch("PROVIDER_TOKEN_ITERATIONS").to_i
+
+data = if File.exist?(path) && !File.empty?(path)
+  JSON.parse(File.read(path))
+else
+  {}
+end
+
+data["providers"] = {} unless data["providers"].is_a?(Hash)
+data["providers"][provider] = {} unless data["providers"][provider].is_a?(Hash)
+data["providers"][provider].delete("token")
+data["providers"][provider]["token_encrypted"] = encrypted_token
+data["providers"][provider]["token_encryption"] = encryption
+data["providers"][provider]["token_iterations"] = iterations
+
+puts JSON.pretty_generate(data)
+RUBY
+
+  mv "$tmp_keys" "$keys_file"
+  chmod 600 "$keys_file"
+  trap - EXIT
+}
+
+delete_provider_token() {
+  local provider="$1"
+  local keys_file
+  local tmp_keys
+  keys_file="$(provider_keys_file)"
+  [[ -f "$keys_file" ]] || return 0
+  tmp_keys="$(mktemp "${keys_file}.tmp.XXXXXX")"
+  trap 'rm -f "$tmp_keys"' EXIT
+
+  PROVIDER_KEYS_FILE="$keys_file" PROVIDER_ID="$provider" ruby > "$tmp_keys" <<'RUBY'
+require "json"
+
+path = ENV.fetch("PROVIDER_KEYS_FILE")
+provider = ENV.fetch("PROVIDER_ID")
+data = JSON.parse(File.read(path))
+data["providers"].delete(provider) if data["providers"].is_a?(Hash)
+puts JSON.pretty_generate(data)
+RUBY
+
+  mv "$tmp_keys" "$keys_file"
+  chmod 600 "$keys_file"
+  trap - EXIT
+}
+
+write_auth_token() {
+  local token="$1"
+  local file
+  local tmp_auth
+  file="$(auth_file)"
+  mkdir -p "$(dirname "$file")"
+  tmp_auth="$(mktemp "${file}.tmp.XXXXXX")"
+  trap 'rm -f "$tmp_auth"' EXIT
+
+  CODEX_AUTH_FILE="$file" CODEX_AUTH_TOKEN="$token" ruby > "$tmp_auth" <<'RUBY'
+require "json"
+
+path = ENV.fetch("CODEX_AUTH_FILE")
+token = ENV.fetch("CODEX_AUTH_TOKEN")
+data = if File.exist?(path) && !File.empty?(path)
+  JSON.parse(File.read(path))
+else
+  {}
+end
+
+data["OPENAI_API_KEY"] = token
+puts JSON.pretty_generate(data)
+RUBY
+
+  mv "$tmp_auth" "$file"
+  chmod 600 "$file"
+  trap - EXIT
 }
 
 normalize_base_url() {
@@ -452,7 +662,7 @@ show_provider_configs() {
   local base_url
   local wire_api
   local auth
-  local token
+  local token_present
   local choice
 
   current_provider="$(active_provider)"
@@ -482,7 +692,10 @@ show_provider_configs() {
     base_url="$(get_provider_value "$provider" "base_url")"
     wire_api="$(get_provider_value "$provider" "wire_api")"
     auth="$(get_provider_value "$provider" "requires_openai_auth")"
-    token="$(get_provider_value "$provider" "experimental_bearer_token")"
+    token_present=0
+    if provider_has_token "$provider"; then
+      token_present=1
+    fi
 
     if [[ "$provider" == "$current_provider" ]]; then
       echo "[model_providers.$provider]（当前）"
@@ -493,10 +706,10 @@ show_provider_configs() {
     echo "  base_url = ${base_url:-<无>}"
     echo "  wire_api = ${wire_api:-<无>}"
     echo "  requires_openai_auth = ${auth:-<无>}"
-    if [[ -n "$token" ]]; then
-      echo "  experimental_bearer_token = $(redact "$token")"
+    if [[ "$token_present" -eq 1 ]]; then
+      echo "  provider key = $(redact)"
     else
-      echo "  experimental_bearer_token = <无>"
+      echo "  provider key = <无>"
     fi
     echo
   done < "$providers_tmp"
@@ -518,7 +731,6 @@ write_provider_config() {
   export CODEX_SWITCH_PROVIDER="$PROVIDER"
   export CODEX_SWITCH_PROVIDER_NAME="$PROVIDER_NAME"
   export CODEX_SWITCH_BASE_URL="$BASE_URL"
-  export CODEX_SWITCH_TOKEN="$TOKEN"
   export CODEX_SWITCH_WIRE_API="$WIRE_API"
 
   local tmp_config
@@ -532,7 +744,6 @@ use warnings;
 my $provider = $ENV{"CODEX_SWITCH_PROVIDER"};
 my $provider_name = $ENV{"CODEX_SWITCH_PROVIDER_NAME"};
 my $base_url = $ENV{"CODEX_SWITCH_BASE_URL"};
-my $token = $ENV{"CODEX_SWITCH_TOKEN"};
 my $wire_api = $ENV{"CODEX_SWITCH_WIRE_API"};
 my $config = $ARGV[0];
 
@@ -624,12 +835,12 @@ for (my $idx = $start + 1; $idx < @lines; $idx++) {
 my @section = @lines[($start + 1) .. ($end - 1)];
 remove_key(\@section, "env_key");
 remove_key(\@section, "env_key_instructions");
+remove_key(\@section, "experimental_bearer_token");
 remove_key(\@section, "model");
 set_key(\@section, "name", $provider_name || $provider);
 set_key(\@section, "base_url", $base_url);
-set_key(\@section, "experimental_bearer_token", $token);
 set_key(\@section, "wire_api", $wire_api);
-set_bool_key(\@section, "requires_openai_auth", 0);
+set_bool_key(\@section, "requires_openai_auth", 1);
 
 splice @lines, $start + 1, $end - $start - 1, @section;
 print @lines;
@@ -642,114 +853,143 @@ PERL
 add_or_update_provider() {
   ensure_config_exists
 
-  if [[ -z "$PROVIDER" ]] && can_prompt; then
-    local provider_input
-    local provider_raw
-    show_back_hint "主菜单"
-    printf "name（将写入 [model_providers.name]）: " >&2
-    IFS= read -r provider_raw || return 0
-    provider_input="$(trim_input "$provider_raw")"
-    if [[ -n "$provider_raw" && -z "$provider_input" ]]; then
-      echo "输入不能只包含空格。"
-      return 0
-    fi
-    if is_back_choice "$provider_input"; then
-      return 0
-    fi
-    PROVIDER="$provider_input"
+  local provider_input
+  local provider_raw
+  show_back_hint "主菜单"
+  printf "name（将写入 [model_providers.name]）: " >&2
+  IFS= read -r provider_raw || return 0
+  provider_input="$(trim_input "$provider_raw")"
+  if [[ -n "$provider_raw" && -z "$provider_input" ]]; then
+    echo "输入不能只包含空格。"
+    return 0
   fi
+  if is_back_choice "$provider_input"; then
+    return 0
+  fi
+  PROVIDER="$provider_input"
 
   if [[ -z "$PROVIDER" ]]; then
-    menu_error_or_die "name 不能为空。请使用 --provider NAME 或在交互模式中输入。"
+    echo "name 不能为空。" >&2
     return 0
   fi
   PROVIDER_NAME="${PROVIDER_NAME:-$PROVIDER}"
 
-  if [[ -z "$BASE_URL" ]] && can_prompt; then
-    local existing_base_url
-    local base_url_raw
-    existing_base_url="$(get_provider_value "$PROVIDER" "base_url" 2>/dev/null || true)"
-    if [[ -n "$existing_base_url" ]]; then
-      printf "Base URL [%s]: " "$existing_base_url" >&2
-    else
-      printf "Base URL: " >&2
-    fi
-    IFS= read -r base_url_raw || return 0
-    BASE_URL="$(trim_input "$base_url_raw")"
-    if [[ -n "$base_url_raw" && -z "$BASE_URL" ]]; then
-      echo "输入不能只包含空格。"
-      return 0
-    fi
-    if is_back_choice "$BASE_URL"; then
-      return 0
-    fi
-    BASE_URL="${BASE_URL:-$existing_base_url}"
+  local existing_base_url
+  local base_url_raw
+  existing_base_url="$(get_provider_value "$PROVIDER" "base_url" 2>/dev/null || true)"
+  if [[ -n "$existing_base_url" ]]; then
+    printf "Base URL [%s]: " "$existing_base_url" >&2
+  else
+    printf "Base URL: " >&2
   fi
+  IFS= read -r base_url_raw || return 0
+  BASE_URL="$(trim_input "$base_url_raw")"
+  if [[ -n "$base_url_raw" && -z "$BASE_URL" ]]; then
+    echo "输入不能只包含空格。"
+    return 0
+  fi
+  if is_back_choice "$BASE_URL"; then
+    return 0
+  fi
+  BASE_URL="${BASE_URL:-$existing_base_url}"
 
   if [[ -z "$BASE_URL" ]]; then
-    menu_error_or_die "Base URL 不能为空。请使用 --base-url URL 或在交互模式中输入。"
+    echo "Base URL 不能为空。" >&2
     return 0
   fi
   BASE_URL="$(normalize_base_url "$BASE_URL")"
 
-  if [[ -z "$TOKEN" ]] && can_prompt; then
-    local existing_token
-    local token_raw
-    existing_token="$(get_provider_value "$PROVIDER" "experimental_bearer_token" 2>/dev/null || true)"
-    if [[ -n "$existing_token" ]]; then
-      printf "Token [直接回车保留现有值]: " >&2
+  local existing_encrypted_token
+  local existing_plain_token
+  local existing_legacy_token
+  local existing_token_present=0
+  local existing_token_encrypted=0
+  local should_write_token=0
+  local token_raw
+  existing_encrypted_token="$(provider_encrypted_token "$PROVIDER" 2>/dev/null || true)"
+  if [[ -n "$existing_encrypted_token" ]]; then
+    existing_token_present=1
+    existing_token_encrypted=1
+  else
+    existing_plain_token="$(provider_plain_token "$PROVIDER" 2>/dev/null || true)"
+    if [[ -n "$existing_plain_token" ]]; then
+      existing_token_present=1
     else
-      printf "Token: " >&2
+      existing_legacy_token="$(get_provider_value "$PROVIDER" "experimental_bearer_token" 2>/dev/null || true)"
+      if [[ -n "$existing_legacy_token" ]]; then
+        existing_token_present=1
+      fi
     fi
-    IFS= read -r token_raw || return 0
-    TOKEN="$(trim_input "$token_raw")"
-    if [[ -n "$token_raw" && -z "$TOKEN" ]]; then
-      echo "输入不能只包含空格。"
-      return 0
+  fi
+  if [[ "$existing_token_present" -eq 1 ]]; then
+    printf "Token [直接回车保留现有值]: " >&2
+  else
+    printf "Token: " >&2
+  fi
+  IFS= read -r token_raw || return 0
+  TOKEN="$(trim_input "$token_raw")"
+  if [[ -n "$token_raw" && -z "$TOKEN" ]]; then
+    echo "输入不能只包含空格。"
+    return 0
+  fi
+  if is_back_choice "$TOKEN"; then
+    return 0
+  fi
+  if [[ -n "$TOKEN" ]]; then
+    should_write_token=1
+  elif [[ "$existing_token_encrypted" -eq 1 ]]; then
+    should_write_token=0
+  else
+    TOKEN="${existing_plain_token:-$existing_legacy_token}"
+    if [[ -n "$TOKEN" ]]; then
+      should_write_token=1
     fi
-    if is_back_choice "$TOKEN"; then
-      return 0
-    fi
-    TOKEN="${TOKEN:-$existing_token}"
   fi
 
-  if [[ -z "$TOKEN" ]]; then
-    menu_error_or_die "Token 不能为空。请使用 --token、--token-stdin 或 CODEX_TOKEN。"
+  if [[ "$should_write_token" -eq 0 && "$existing_token_present" -ne 1 ]]; then
+    echo "Token 不能为空。" >&2
+    return 0
+  fi
+  if [[ "$should_write_token" -eq 1 && -z "$TOKEN" ]]; then
+    echo "Token 不能为空。" >&2
     return 0
   fi
 
   WIRE_API="responses"
   PROVIDER_NAME="$PROVIDER"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "配置文件: $CONFIG"
-    echo "[model_providers.$PROVIDER].name -> $PROVIDER_NAME"
-    echo "[model_providers.$PROVIDER].base_url -> $BASE_URL"
-    echo "[model_providers.$PROVIDER].experimental_bearer_token -> $(redact "$TOKEN")"
-    echo "[model_providers.$PROVIDER].wire_api -> $WIRE_API"
-    echo "[model_providers.$PROVIDER].requires_openai_auth -> false"
-    if [[ -n "$MODEL" ]]; then
-      echo "model_provider -> $PROVIDER"
-      echo "model -> $MODEL"
-    fi
-    exit 0
-  fi
-
   local backup
+  local keys_backup
   backup="$(backup_config)"
+  keys_backup=""
+  if [[ "$should_write_token" -eq 1 ]]; then
+    keys_backup="$(backup_file_if_exists "$(provider_keys_file)")"
+  fi
   write_provider_config
+  if [[ "$should_write_token" -eq 1 ]]; then
+    write_provider_token "$PROVIDER" "$TOKEN"
+  fi
   if [[ -n "$MODEL" ]]; then
+    if [[ -z "$TOKEN" ]]; then
+      if ! TOKEN="$(read_provider_token "$PROVIDER")"; then
+        echo "provider key 解密失败，未设置当前模型。" >&2
+        return 0
+      fi
+    fi
     write_current_provider "$PROVIDER" "$MODEL"
   fi
 
   echo "已更新: $CONFIG"
   echo "备份文件: $backup"
+  if [[ -n "$keys_backup" ]]; then
+    echo "Key 备份文件: $keys_backup"
+  fi
   echo "[model_providers.$PROVIDER]"
   echo "name -> $PROVIDER_NAME"
   echo "base_url -> $BASE_URL"
-  echo "experimental_bearer_token -> $(redact "$TOKEN")"
+  echo "provider key -> $(redact "$TOKEN")"
   echo "wire_api -> $WIRE_API"
-  echo "requires_openai_auth -> false"
+  echo "requires_openai_auth -> true"
   if [[ -n "$MODEL" ]]; then
     echo "model_provider -> $PROVIDER"
     echo "model -> $MODEL"
@@ -794,7 +1034,9 @@ delete_provider() {
   fi
 
   local backup
+  local keys_backup
   backup="$(backup_config)"
+  keys_backup="$(backup_file_if_exists "$(provider_keys_file)")"
 
   export CODEX_DELETE_PROVIDER="$provider"
   local tmp_config
@@ -826,9 +1068,13 @@ PERL
 
   mv "$tmp_config" "$CONFIG"
   trap - EXIT
+  delete_provider_token "$provider"
 
   echo "已删除 [model_providers.$provider]"
   echo "备份文件: $backup"
+  if [[ -n "$keys_backup" ]]; then
+    echo "Key 备份文件: $keys_backup"
+  fi
 
   if [[ "$was_active" -eq 1 ]]; then
     if list_providers | grep -q .; then
@@ -918,9 +1164,21 @@ set_current_provider() {
   fi
 
   BASE_URL="$(get_provider_value "$provider" "base_url")"
-  TOKEN="$(get_provider_value "$provider" "experimental_bearer_token")"
-  if [[ -z "$BASE_URL" || -z "$TOKEN" ]]; then
-    echo "[model_providers.$provider] 缺少 base_url 或 experimental_bearer_token，无法获取模型列表。"
+  if [[ -z "$BASE_URL" ]]; then
+    echo "[model_providers.$provider] 缺少 base_url 或 provider key，无法获取模型列表。"
+    return 0
+  fi
+
+  if provider_has_token "$provider"; then
+    if ! TOKEN="$(read_provider_token "$provider")"; then
+      echo "provider key 解密失败，未更新 auth.json。" >&2
+      return 0
+    fi
+  else
+    TOKEN="$(get_provider_value "$provider" "experimental_bearer_token" 2>/dev/null || true)"
+  fi
+  if [[ -z "$TOKEN" ]]; then
+    echo "[model_providers.$provider] 缺少 base_url 或 provider key，无法获取模型列表。"
     return 0
   fi
 
@@ -931,45 +1189,21 @@ set_current_provider() {
   fi
   model="$MODEL"
 
+  local auth_backup
   backup="$(backup_config)"
+  auth_backup="$(backup_file_if_exists "$(auth_file)")"
   write_current_provider "$provider" "$model"
+  write_auth_token "$TOKEN"
 
   echo "已更新: $CONFIG"
   echo "备份文件: $backup"
+  if [[ -n "$auth_backup" ]]; then
+    echo "Auth 备份文件: $auth_backup"
+  fi
   echo "model_provider -> $provider"
   echo "model -> $model"
+  echo "auth.json OPENAI_API_KEY -> $(redact "$TOKEN")"
   show_restart_hint
-}
-
-apply_fast_start_hosts() {
-  local comment="# Codex fast-start workaround: make Statsig fail fast when ab.chatgpt.com is unreachable"
-  local entry="127.0.0.1 ab.chatgpt.com"
-
-  if grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]]+ab\.chatgpt\.com([[:space:]]|$)' /etc/hosts; then
-    echo "hosts 加速配置已存在: $entry"
-    return
-  fi
-
-  local tmp_hosts
-  tmp_hosts="$(mktemp "/tmp/${SCRIPT_NAME}.hosts.XXXXXX")"
-  trap 'rm -f "$tmp_hosts"' RETURN
-
-  cp /etc/hosts "$tmp_hosts"
-  {
-    printf '\n%s\n' "$comment"
-    printf '%s\n' "$entry"
-  } >> "$tmp_hosts"
-
-  if [[ -w /etc/hosts ]]; then
-    cp "$tmp_hosts" /etc/hosts
-  else
-    echo "需要 sudo 权限更新 /etc/hosts。" >&2
-    sudo cp "$tmp_hosts" /etc/hosts
-  fi
-
-  rm -f "$tmp_hosts"
-  trap - RETURN
-  echo "已添加 hosts 加速配置: $entry"
 }
 
 show_menu() {
@@ -983,7 +1217,6 @@ show_menu() {
   2) 查看模型配置
   3) 删除模型配置
   4) 设置当前模型
-  5) 提升启动速度（hosts 加速配置）
   q) 退出
 EOF
 
@@ -1011,9 +1244,6 @@ EOF
       4)
         set_current_provider
         ;;
-      5)
-        apply_fast_start_hosts
-        ;;
       q|Q)
         exit 0
         ;;
@@ -1025,68 +1255,13 @@ EOF
 }
 
 main() {
-  local arg_count=$#
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --config)
-        CONFIG="${2:?missing value for --config}"
-        shift 2
-        ;;
-      --provider)
-        PROVIDER="${2:?missing value for --provider}"
-        shift 2
-        ;;
-      --name)
-        PROVIDER="${2:?missing value for --name}"
-        shift 2
-        ;;
-      --base-url|--baseurl)
-        BASE_URL="${2:?missing value for --base-url}"
-        shift 2
-        ;;
-      --token)
-        TOKEN="${2:?missing value for --token}"
-        shift 2
-        ;;
-      --token-stdin)
-        if ! IFS= read -r TOKEN; then
-          echo "从标准输入读取 token 失败" >&2
-          exit 2
-        fi
-        shift
-        ;;
-      --model)
-        MODEL="${2:?missing value for --model}"
-        shift 2
-        ;;
-      --wire-api)
-        WIRE_API="${2:?missing value for --wire-api}"
-        shift 2
-        ;;
-      --dry-run)
-        DRY_RUN=1
-        shift
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      *)
-        echo "未知参数: $1" >&2
-        usage >&2
-        exit 2
-        ;;
-    esac
-  done
-
-  if [[ "$arg_count" -eq 0 ]]; then
-    MENU_MODE=1
-    show_menu
-  else
-    MENU_MODE=0
-    add_or_update_provider
+  if [[ $# -gt 0 ]]; then
+    echo "此脚本只支持交互模式，不再支持命令行参数。" >&2
+    usage >&2
+    exit 2
   fi
+
+  show_menu
 }
 
 main "$@"
