@@ -29,6 +29,12 @@ chmod +x switch-codex-config.sh
 ./switch-codex-config.sh
 ```
 
+## 依赖与 Windows
+
+脚本依赖 `bash`、`openssl`、`curl`、`awk`、`sed`、`perl` 等常见命令。
+
+在 Windows 上建议使用 Git Bash 或 WSL 运行，并确保 `openssl` 可以在 PATH 中直接调用。脚本不依赖 Ruby、Node.js 或 jq。
+
 ## 远程执行
 
 直接运行交互菜单：

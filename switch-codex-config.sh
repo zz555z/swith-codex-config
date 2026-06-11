@@ -147,59 +147,131 @@ decrypt_provider_token() {
   fi
 }
 
+json_escape() {
+  printf '%s' "$1" | LC_ALL=C sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+provider_keys_records() {
+  local file
+  file="$(provider_keys_file)"
+  [[ -f "$file" ]] || return 0
+
+  LC_ALL=C awk '
+    BEGIN {
+      sep = sprintf("%c", 28)
+    }
+    function flush() {
+      if (provider != "") {
+        print provider sep encrypted sep encryption sep iterations sep plain
+      }
+    }
+    function string_value(line) {
+      sub(/^[^:]*:[[:space:]]*"/, "", line)
+      sub(/",?[[:space:]]*$/, "", line)
+      return line
+    }
+    function number_value(line) {
+      sub(/^[^:]*:[[:space:]]*/, "", line)
+      sub(/,?[[:space:]]*$/, "", line)
+      return line
+    }
+    /^    "[^"]+"[[:space:]]*:[[:space:]]*[{][[:space:]]*,?$/ {
+      flush()
+      provider = $0
+      sub(/^    "/, "", provider)
+      sub(/"[[:space:]]*:[[:space:]]*[{][[:space:]]*,?$/, "", provider)
+      encrypted = ""
+      encryption = ""
+      iterations = ""
+      plain = ""
+      next
+    }
+    provider != "" && /^[[:space:]]*"token_encrypted"[[:space:]]*:/ {
+      encrypted = string_value($0)
+      next
+    }
+    provider != "" && /^[[:space:]]*"token_encryption"[[:space:]]*:/ {
+      encryption = string_value($0)
+      next
+    }
+    provider != "" && /^[[:space:]]*"token_iterations"[[:space:]]*:/ {
+      iterations = number_value($0)
+      next
+    }
+    provider != "" && /^[[:space:]]*"token"[[:space:]]*:/ {
+      plain = string_value($0)
+      next
+    }
+    END {
+      flush()
+    }
+  ' "$file"
+}
+
+emit_provider_key_entry() {
+  local provider="$1"
+  local encrypted="$2"
+  local encryption="$3"
+  local iterations="$4"
+  local plain="$5"
+  local provider_json
+  local encrypted_json
+  local encryption_json
+  local plain_json
+
+  provider_json="$(json_escape "$provider")"
+  printf '    "%s": {\n' "$provider_json"
+  if [[ -n "$encrypted" ]]; then
+    encrypted_json="$(json_escape "$encrypted")"
+    encryption_json="$(json_escape "${encryption:-$PROVIDER_TOKEN_ENCRYPTION}")"
+    iterations="${iterations:-$PROVIDER_TOKEN_ITERATIONS}"
+    printf '      "token_encrypted": "%s",\n' "$encrypted_json"
+    printf '      "token_encryption": "%s",\n' "$encryption_json"
+    printf '      "token_iterations": %s\n' "$iterations"
+  else
+    plain_json="$(json_escape "$plain")"
+    printf '      "token": "%s"\n' "$plain_json"
+  fi
+  printf '    }'
+}
+
 provider_encrypted_token() {
   local provider="$1"
-  local keys_file
-  keys_file="$(provider_keys_file)"
-  [[ -f "$keys_file" ]] || return 0
 
-  PROVIDER_KEYS_FILE="$keys_file" PROVIDER_ID="$provider" ruby <<'RUBY'
-require "json"
-
-path = ENV.fetch("PROVIDER_KEYS_FILE")
-provider = ENV.fetch("PROVIDER_ID")
-data = JSON.parse(File.read(path))
-value = data.dig("providers", provider, "token_encrypted")
-print value if value.is_a?(String)
-RUBY
+  provider_keys_records | LC_ALL=C awk -v provider="$provider" '
+    BEGIN { sep = sprintf("%c", 28); FS = sep }
+    $1 == provider && $2 != "" {
+      print $2
+      exit
+    }
+  '
 }
 
 provider_plain_token() {
   local provider="$1"
-  local keys_file
-  keys_file="$(provider_keys_file)"
-  [[ -f "$keys_file" ]] || return 0
 
-  PROVIDER_KEYS_FILE="$keys_file" PROVIDER_ID="$provider" ruby <<'RUBY'
-require "json"
-
-path = ENV.fetch("PROVIDER_KEYS_FILE")
-provider = ENV.fetch("PROVIDER_ID")
-data = JSON.parse(File.read(path))
-value = data.dig("providers", provider, "token")
-print value if value.is_a?(String)
-RUBY
+  provider_keys_records | LC_ALL=C awk -v provider="$provider" '
+    BEGIN { sep = sprintf("%c", 28); FS = sep }
+    $1 == provider && $5 != "" {
+      print $5
+      exit
+    }
+  '
 }
 
 provider_has_token() {
   local provider="$1"
-  local keys_file
-  keys_file="$(provider_keys_file)"
-  [[ -f "$keys_file" ]] || return 1
 
-  PROVIDER_KEYS_FILE="$keys_file" PROVIDER_ID="$provider" ruby <<'RUBY'
-require "json"
-
-path = ENV.fetch("PROVIDER_KEYS_FILE")
-provider = ENV.fetch("PROVIDER_ID")
-data = JSON.parse(File.read(path))
-entry = data.dig("providers", provider)
-exit 1 unless entry.is_a?(Hash)
-encrypted = entry["token_encrypted"]
-plain = entry["token"]
-has_token = (encrypted.is_a?(String) && !encrypted.empty?) || (plain.is_a?(String) && !plain.empty?)
-exit(has_token ? 0 : 1)
-RUBY
+  provider_keys_records | LC_ALL=C awk -v provider="$provider" '
+    BEGIN { sep = sprintf("%c", 28); FS = sep; found = 0 }
+    $1 == provider && ($2 != "" || $5 != "") {
+      found = 1
+      exit
+    }
+    END {
+      exit(found ? 0 : 1)
+    }
+  '
 }
 
 read_provider_token() {
@@ -225,44 +297,49 @@ write_provider_token() {
   local encrypted_token
   local keys_file
   local tmp_keys
+  local records_tmp
+  local record_sep
+  local first_entry
+  local rec_provider
+  local rec_encrypted
+  local rec_encryption
+  local rec_iterations
+  local rec_plain
   encrypted_token="$(encrypt_provider_token "$token")" || return 1
   keys_file="$(provider_keys_file)"
   mkdir -p "$(dirname "$keys_file")"
   tmp_keys="$(mktemp "${keys_file}.tmp.XXXXXX")"
-  trap 'rm -f "$tmp_keys"' EXIT
+  records_tmp="$(mktemp "/tmp/${SCRIPT_NAME}.provider-records.XXXXXX")"
+  trap 'rm -f "$tmp_keys" "$records_tmp"' EXIT
+  provider_keys_records > "$records_tmp"
+  record_sep="$(printf '\034')"
 
-  PROVIDER_KEYS_FILE="$keys_file" \
-    PROVIDER_ID="$provider" \
-    PROVIDER_TOKEN_ENCRYPTED="$encrypted_token" \
-    PROVIDER_TOKEN_ENCRYPTION="$PROVIDER_TOKEN_ENCRYPTION" \
-    PROVIDER_TOKEN_ITERATIONS="$PROVIDER_TOKEN_ITERATIONS" \
-    ruby > "$tmp_keys" <<'RUBY'
-require "json"
-
-path = ENV.fetch("PROVIDER_KEYS_FILE")
-provider = ENV.fetch("PROVIDER_ID")
-encrypted_token = ENV.fetch("PROVIDER_TOKEN_ENCRYPTED")
-encryption = ENV.fetch("PROVIDER_TOKEN_ENCRYPTION")
-iterations = ENV.fetch("PROVIDER_TOKEN_ITERATIONS").to_i
-
-data = if File.exist?(path) && !File.empty?(path)
-  JSON.parse(File.read(path))
-else
-  {}
-end
-
-data["providers"] = {} unless data["providers"].is_a?(Hash)
-data["providers"][provider] = {} unless data["providers"][provider].is_a?(Hash)
-data["providers"][provider].delete("token")
-data["providers"][provider]["token_encrypted"] = encrypted_token
-data["providers"][provider]["token_encryption"] = encryption
-data["providers"][provider]["token_iterations"] = iterations
-
-puts JSON.pretty_generate(data)
-RUBY
+  {
+    printf '{\n'
+    printf '  "providers": {\n'
+    first_entry=1
+    while IFS="$record_sep" read -r rec_provider rec_encrypted rec_encryption rec_iterations rec_plain; do
+      [[ -n "$rec_provider" ]] || continue
+      [[ "$rec_provider" == "$provider" ]] && continue
+      [[ -z "$rec_encrypted" && -z "$rec_plain" ]] && continue
+      if [[ "$first_entry" -eq 0 ]]; then
+        printf ',\n'
+      fi
+      emit_provider_key_entry "$rec_provider" "$rec_encrypted" "$rec_encryption" "$rec_iterations" "$rec_plain"
+      first_entry=0
+    done < "$records_tmp"
+    if [[ "$first_entry" -eq 0 ]]; then
+      printf ',\n'
+    fi
+    emit_provider_key_entry "$provider" "$encrypted_token" "$PROVIDER_TOKEN_ENCRYPTION" "$PROVIDER_TOKEN_ITERATIONS" ""
+    printf '\n'
+    printf '  }\n'
+    printf '}\n'
+  } > "$tmp_keys"
 
   mv "$tmp_keys" "$keys_file"
   chmod 600 "$keys_file"
+  rm -f "$records_tmp"
   trap - EXIT
 }
 
@@ -270,23 +347,44 @@ delete_provider_token() {
   local provider="$1"
   local keys_file
   local tmp_keys
+  local records_tmp
+  local record_sep
+  local first_entry
+  local rec_provider
+  local rec_encrypted
+  local rec_encryption
+  local rec_iterations
+  local rec_plain
   keys_file="$(provider_keys_file)"
   [[ -f "$keys_file" ]] || return 0
   tmp_keys="$(mktemp "${keys_file}.tmp.XXXXXX")"
-  trap 'rm -f "$tmp_keys"' EXIT
+  records_tmp="$(mktemp "/tmp/${SCRIPT_NAME}.provider-records.XXXXXX")"
+  trap 'rm -f "$tmp_keys" "$records_tmp"' EXIT
+  provider_keys_records > "$records_tmp"
+  record_sep="$(printf '\034')"
 
-  PROVIDER_KEYS_FILE="$keys_file" PROVIDER_ID="$provider" ruby > "$tmp_keys" <<'RUBY'
-require "json"
-
-path = ENV.fetch("PROVIDER_KEYS_FILE")
-provider = ENV.fetch("PROVIDER_ID")
-data = JSON.parse(File.read(path))
-data["providers"].delete(provider) if data["providers"].is_a?(Hash)
-puts JSON.pretty_generate(data)
-RUBY
+  {
+    printf '{\n'
+    printf '  "providers": {\n'
+    first_entry=1
+    while IFS="$record_sep" read -r rec_provider rec_encrypted rec_encryption rec_iterations rec_plain; do
+      [[ -n "$rec_provider" ]] || continue
+      [[ "$rec_provider" == "$provider" ]] && continue
+      [[ -z "$rec_encrypted" && -z "$rec_plain" ]] && continue
+      if [[ "$first_entry" -eq 0 ]]; then
+        printf ',\n'
+      fi
+      emit_provider_key_entry "$rec_provider" "$rec_encrypted" "$rec_encryption" "$rec_iterations" "$rec_plain"
+      first_entry=0
+    done < "$records_tmp"
+    printf '\n'
+    printf '  }\n'
+    printf '}\n'
+  } > "$tmp_keys"
 
   mv "$tmp_keys" "$keys_file"
   chmod 600 "$keys_file"
+  rm -f "$records_tmp"
   trap - EXIT
 }
 
@@ -294,25 +392,77 @@ write_auth_token() {
   local token="$1"
   local file
   local tmp_auth
+  local token_json
   file="$(auth_file)"
   mkdir -p "$(dirname "$file")"
   tmp_auth="$(mktemp "${file}.tmp.XXXXXX")"
   trap 'rm -f "$tmp_auth"' EXIT
+  token_json="$(json_escape "$token")"
 
-  CODEX_AUTH_FILE="$file" CODEX_AUTH_TOKEN="$token" ruby > "$tmp_auth" <<'RUBY'
-require "json"
+  if [[ ! -s "$file" ]]; then
+    {
+      printf '{\n'
+      printf '  "OPENAI_API_KEY": "%s"\n' "$token_json"
+      printf '}\n'
+    } > "$tmp_auth"
+  else
+    LC_ALL=C awk -v token="$token_json" '
+      BEGIN {
+        key_line = "  \"OPENAI_API_KEY\": \"" token "\""
+      }
+      {
+        lines[NR] = $0
+      }
+      END {
+        if (NR == 0 || (NR == 1 && lines[1] ~ /^[[:space:]]*[{][[:space:]]*[}][[:space:]]*$/)) {
+          print "{"
+          print key_line
+          print "}"
+          exit
+        }
 
-path = ENV.fetch("CODEX_AUTH_FILE")
-token = ENV.fetch("CODEX_AUTH_TOKEN")
-data = if File.exist?(path) && !File.empty?(path)
-  JSON.parse(File.read(path))
-else
-  {}
-end
+        found = 0
+        for (idx = 1; idx <= NR; idx++) {
+          if (lines[idx] ~ /^[[:space:]]*"OPENAI_API_KEY"[[:space:]]*:/) {
+            comma = lines[idx] ~ /,[[:space:]]*$/ ? "," : ""
+            lines[idx] = key_line comma
+            found = 1
+          }
+        }
 
-data["OPENAI_API_KEY"] = token
-puts JSON.pretty_generate(data)
-RUBY
+        if (!found) {
+          close_idx = 0
+          last_field_idx = 0
+          for (idx = 1; idx <= NR; idx++) {
+            if (lines[idx] ~ /^[[:space:]]*[}][[:space:]]*$/) {
+              close_idx = idx
+            }
+          }
+          if (close_idx == 0) {
+            print "{"
+            print key_line
+            print "}"
+            exit
+          }
+          for (idx = 1; idx < close_idx; idx++) {
+            if (lines[idx] ~ /^[[:space:]]*"/) {
+              last_field_idx = idx
+            }
+          }
+          if (last_field_idx > 0 && lines[last_field_idx] !~ /,[[:space:]]*$/) {
+            lines[last_field_idx] = lines[last_field_idx] ","
+          }
+        }
+
+        for (idx = 1; idx <= NR; idx++) {
+          if (!found && idx == close_idx) {
+            print key_line
+          }
+          print lines[idx]
+        }
+      }
+    ' "$file" > "$tmp_auth"
+  fi
 
   mv "$tmp_auth" "$file"
   chmod 600 "$file"
@@ -458,21 +608,7 @@ PERL
 
 parse_model_ids() {
   local input_file="$1"
-  if command -v jq >/dev/null 2>&1; then
-    jq -r '
-      if type == "object" and (.data | type) == "array" then
-        .data[]?.id
-      elif type == "object" and (.models | type) == "array" then
-        .models[]?.id
-      elif type == "array" then
-        .[]?.id
-      else
-        empty
-      end
-    ' "$input_file" 2>/dev/null
-  else
-    perl -0777 -ne 'while (/"id"[[:space:]]*:[[:space:]]*"([^"]+)"/g) { print "$1\n" }' "$input_file"
-  fi
+  perl -0777 -ne 'while (/"id"[[:space:]]*:[[:space:]]*"([^"]+)"/g) { print "$1\n" }' "$input_file"
 }
 
 fetch_model_ids() {
